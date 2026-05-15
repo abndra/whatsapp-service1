@@ -223,27 +223,16 @@ app.post("/send-activation", auth, async (req, res) => {
     activationPending.set(jid, { sentAt: Date.now(), parentName: name });
     activationConfirmed.delete(jid);
 
-    let id;
-    try {
-      // Quick-reply buttons (the closest to a green tap-to-reply CTA on Baileys).
-      const buttonsMsg = {
-        text: bodyText,
-        footer: "منصة غيابي · للتواصل مع المدرسة",
-        buttons: [
-          { buttonId: "ACTIVATE_YES", buttonText: { displayText: "✅ نعم أريد" }, type: 1 },
-        ],
-        headerType: 1,
-      };
-      const r = await sock.sendMessage(jid, buttonsMsg);
-      id = r?.key?.id;
-    } catch (e) {
-      console.warn("buttons send failed, falling back to text:", e?.message || e);
-      const fallback =
-        bodyText +
-        "\n\nللتفعيل، يرجى الرد بكلمة: *نعم أريد*";
-      const r = await sock.sendMessage(jid, { text: fallback });
-      id = r?.key?.id;
-    }
+    // NOTE: WhatsApp no longer renders Baileys interactive buttons on regular
+    // (non-Business-API) accounts. We send a clear text CTA instead — the
+    // auto-reply listener below confirms once the parent replies with "نعم".
+    const fullText =
+      bodyText +
+      "\n\n👈 للتفعيل، يكفي الرد على هذه الرسالة بكلمة:\n\n*نعم*\n\n" +
+      "وسيتم تفعيل اشتراككم تلقائيًا خلال ثوانٍ.";
+
+    const r = await sock.sendMessage(jid, { text: fullText });
+    const id = r?.key?.id;
 
     res.json({ ok: true, id });
   } catch (e) {
