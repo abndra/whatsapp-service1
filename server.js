@@ -27,6 +27,9 @@ let connState = "disconnected";
 let starting = false;
 let lastError = null;
 let lastUpdateAt = null;
+let lastInbound = null;
+let lastActivation = null;
+const serviceStartedAt = Date.now();
 
 const activationPending = new Map();
 const activationConfirmed = new Set();
@@ -42,6 +45,15 @@ function jidFor(to) {
 }
 function phoneFromJid(jid) {
   return String(jid || "").replace(/@.*$/, "").replace(/[^\d]/g, "");
+}
+
+function normalizePhone(raw) {
+  let phone = String(raw || "").replace(/\D/g, "");
+  if (!phone) return "";
+  if (phone.startsWith("00")) phone = phone.slice(2);
+  if (phone.startsWith("968")) return phone;
+  if (phone.startsWith("0")) phone = phone.slice(1);
+  return phone.length === 8 ? `968${phone}` : phone;
 }
 
 function unwrapMessage(message) {
@@ -157,7 +169,19 @@ async function incrementFirestoreField(path, fieldPath, amount = 1) {
 }
 
 function safeDocId(value) {
-  return encodeURIComponent(String(value)).replaceAll("%", "_");
+  return encodeURIComponent(normalizePhone(value) || String(value)).replaceAll("%", "_");
+}
+
+function timestampToMs(value) {
+  const n = Number(value || 0);
+  if (!n) return 0;
+  return n > 10_000_000_000 ? n : n * 1000;
+}
+
+function shouldProcessIncoming(msg) {
+  if (!msg?.message || msg.key?.fromMe) return false;
+  const ts = timestampToMs(msg.messageTimestamp);
+  return !ts || ts >= serviceStartedAt - 5 * 60 * 1000;
 }
 
 // ---- Firestore helpers ----
@@ -188,15 +212,16 @@ async function logMessage({ phone, direction, text, parentName }) {
 }
 
 async function setParentActivation({ phone, parentName, activated }) {
-  if (!phone) return;
+  const normalizedPhone = normalizePhone(phone);
+  if (!normalizedPhone) return;
   try {
     const patch = {
-      phone,
+      phone: normalizedPhone,
       activated: !!activated,
     };
     if (parentName) patch.parentName = parentName;
     if (activated) patch.activatedAt = "SERVER_TIMESTAMP";
-    await mergeFirestoreDoc(`parents/${safeDocId(phone)}`, patch);
+    await mergeFirestoreDoc(`parents/${safeDocId(normalizedPhone)}`, patch);
   } catch (e) {
     console.error("setParentActivation failed", e?.message || e);
   }
@@ -239,18 +264,19 @@ async function start() {
 
     sock.ev.on("messages.upsert", async (m) => {
       try {
-        if (m.type !== "notify") return;
         for (const msg of m.messages || []) {
-          if (!msg.message || msg.key.fromMe) continue;
+          if (!shouldProcessIncoming(msg)) continue;
           const jid = msg.key.remoteJid;
-          if (!jid || !jid.endsWith("@s.whatsapp.net")) continue;
+          if (!jid || jid.endsWith("@g.us") || jid === "status@broadcast") continue;
 
           const trimmed = extractMessageText(msg.message);
           if (!trimmed) continue;
 
-          const phone = phoneFromJid(jid);
+          const phone = normalizePhone(phoneFromJid(jid));
           const pending = activationPending.get(jid);
           const parentName = pending?.parentName;
+          lastInbound = { phone, text: trimmed, at: new Date().toISOString() };
+          console.log("incoming WhatsApp message", { phone, text: trimmed });
 
           // Log inbound message
           await logMessage({ phone, direction: "in", text: trimmed, parentName });
@@ -264,8 +290,10 @@ async function start() {
             try {
               await sock.sendMessage(jid, { text: reply });
               await logMessage({ phone, direction: "out", text: reply, parentName });
+              lastActivation = { phone, at: new Date().toISOString(), replied: true };
             } catch (e) {
               console.error("auto-reply send failed", e?.message || e);
+              lastActivation = { phone, at: new Date().toISOString(), replied: false, error: String(e?.message || e) };
             }
           }
         }
@@ -295,7 +323,7 @@ function auth(req, res, next) {
 }
 
 app.get("/", (_req, res) => res.json({ ok: true, state: connState }));
-app.get("/status", auth, (_req, res) => res.json({ state: connState, hasQR: !!latestQR, lastError, lastUpdateAt }));
+app.get("/status", auth, (_req, res) => res.json({ state: connState, hasQR: !!latestQR, lastError, lastUpdateAt, lastInbound, lastActivation }));
 app.get("/qr", auth, (_req, res) => {
   if (!latestQR) return res.status(404).json({ error: "no_qr", state: connState });
   res.json({ qr: latestQR, state: connState });
@@ -327,7 +355,7 @@ app.post("/send-activation", auth, async (req, res) => {
 
     const name = (parentName && String(parentName).trim()) || "ولي الأمر";
     const jid = jidFor(to);
-    const phone = phoneFromJid(jid);
+    const phone = normalizePhone(phoneFromJid(jid));
 
     const bodyText =
       "السلام عليكم ورحمة الله وبركاته،\n\n" +
