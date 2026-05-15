@@ -104,11 +104,11 @@ function extractMessageText(message) {
 function isActivationYes(text) {
   const normalized = String(text || "")
     .normalize("NFKD")
-    .replace(/[\u064B-\u065F\u0670\u200C\u200D]/g, "")
+    .replace(/[\u064B-\u065F\u0670\u200C\u200Dـ*~_`]/g, "")
     .replace(/[إأآ]/g, "ا")
     .replace(/\s+/g, " ")
     .trim();
-  return /(^|[\s,.!?؟،؛:*_\-])نعم([\s,.!?؟،؛:*_\-]|$)/u.test(normalized) || /^yes$/i.test(normalized) || normalized === "ACTIVATE_YES";
+  return normalized === "نعم" || /(^|[\s,.!?؟،؛:\-])نعم([\s,.!?؟،؛:\-]|$)/u.test(normalized) || /^yes$/i.test(normalized) || normalized === "ACTIVATE_YES";
 }
 
 function firestoreValue(value) {
@@ -227,6 +227,25 @@ async function setParentActivation({ phone, parentName, activated }) {
   }
 }
 
+async function getParentDoc(phone) {
+  const normalizedPhone = normalizePhone(phone);
+  if (!normalizedPhone) return null;
+  try {
+    const url = `${FIRESTORE_BASE_URL}/parents/${safeDocId(normalizedPhone)}?key=${encodeURIComponent(FIREBASE_API_KEY)}`;
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const json = await r.json();
+    const fields = json?.fields || {};
+    return {
+      phone: normalizedPhone,
+      parentName: fields.parentName?.stringValue || null,
+      activated: !!fields.activated?.booleanValue,
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function start() {
   if (starting) return;
   starting = true;
@@ -272,28 +291,42 @@ async function start() {
           const trimmed = extractMessageText(msg.message);
           if (!trimmed) continue;
 
-          const phone = normalizePhone(phoneFromJid(jid));
-          const pending = activationPending.get(jid);
-          const parentName = pending?.parentName;
-          lastInbound = { phone, text: trimmed, at: new Date().toISOString() };
-          console.log("incoming WhatsApp message", { phone, text: trimmed });
+          // Prefer the real phone number even when the JID is a LID
+          const senderPn = msg.key?.senderPn || msg.key?.participantPn || "";
+          const phone = normalizePhone(senderPn || phoneFromJid(jid));
+          if (!phone) continue;
+
+          // Try to find pending activation by phone or by jid
+          let pending = activationPending.get(phone) || activationPending.get(jid);
+          let parentName = pending?.parentName || null;
+
+          // Fallback: look up parent doc in Firestore (covers service restart / LID mismatch)
+          if (!parentName) {
+            const doc = await getParentDoc(phone);
+            if (doc?.parentName) parentName = doc.parentName;
+          }
+
+          lastInbound = { phone, jid, text: trimmed, at: new Date().toISOString() };
+          console.log("incoming WhatsApp message", { phone, jid, text: trimmed });
 
           // Log inbound message
           await logMessage({ phone, direction: "in", text: trimmed, parentName });
 
           const looksLikeYes = isActivationYes(trimmed);
+          const alreadyConfirmed = activationConfirmed.has(phone) || activationConfirmed.has(jid);
 
-          if (looksLikeYes && !activationConfirmed.has(jid)) {
+          if (looksLikeYes && !alreadyConfirmed) {
+            activationConfirmed.add(phone);
             activationConfirmed.add(jid);
             await setParentActivation({ phone, parentName, activated: true });
             const reply = "✅ تم تفعيل اشتراككم في نظام «غيابي» بنجاح.\nستصلكم إشعارات حضور وغياب أبنائكم بإذن الله.";
             try {
               await sock.sendMessage(jid, { text: reply });
               await logMessage({ phone, direction: "out", text: reply, parentName });
-              lastActivation = { phone, at: new Date().toISOString(), replied: true };
+              lastActivation = { phone, jid, at: new Date().toISOString(), replied: true };
             } catch (e) {
               console.error("auto-reply send failed", e?.message || e);
-              lastActivation = { phone, at: new Date().toISOString(), replied: false, error: String(e?.message || e) };
+              lastActivation = { phone, jid, at: new Date().toISOString(), replied: false, error: String(e?.message || e) };
             }
           }
         }
@@ -364,11 +397,14 @@ app.post("/send-activation", auth, async (req, res) => {
       "والذي يتيح لكم استقبال إشعارات غياب أبنائكم ومتابعة حضورهم بشكل مستمر.\n\n" +
       "هل تودون تفعيل نظام «غيابي» لتصلكم إشعارات الحضور والغياب بشكل مباشر؟";
 
-    activationPending.set(jid, { sentAt: Date.now(), parentName: name });
+    const pendingEntry = { sentAt: Date.now(), parentName: name };
+    activationPending.set(jid, pendingEntry);
+    if (phone) activationPending.set(phone, pendingEntry);
     activationConfirmed.delete(jid);
+    if (phone) activationConfirmed.delete(phone);
     await setParentActivation({ phone, parentName: name, activated: false });
 
-    const fullText = bodyText + "\n\n👈 للتفعيل، يكفي الرد على هذه الرسالة بكلمة:\n\n*نعم*\n\nوسيتم تفعيل اشتراككم تلقائيًا خلال ثوانٍ.";
+    const fullText = bodyText + "\n\n👈 للتفعيل، يكفي الرد على هذه الرسالة بكلمة: نعم\n\nوسيتم تفعيل اشتراككم تلقائيًا خلال ثوانٍ.";
 
     const r = await sock.sendMessage(jid, { text: fullText });
     await logMessage({ phone, direction: "out", text: fullText, parentName: name });
