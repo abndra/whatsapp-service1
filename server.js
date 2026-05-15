@@ -7,25 +7,15 @@ import {
   DisconnectReason,
   fetchLatestBaileysVersion,
 } from "@whiskeysockets/baileys";
-import { initializeApp } from "firebase/app";
-import {
-  getFirestore, doc, setDoc, addDoc, collection, serverTimestamp, increment,
-} from "firebase/firestore";
 
 const PORT = process.env.PORT || 3000;
 const TOKEN = process.env.SERVICE_TOKEN || "change-me";
 const AUTH_DIR = process.env.AUTH_DIR || "/data/auth";
 
-// ---- Firestore (same project as the web app) ----
-const firebaseApp = initializeApp({
-  apiKey: "AIzaSyCsGDgxVWwZMg15Nmc__lCDj2DcfTH1MyM",
-  authDomain: "bahr-educational.firebaseapp.com",
-  projectId: "bahr-educational",
-  storageBucket: "bahr-educational.firebasestorage.app",
-  messagingSenderId: "1006438253592",
-  appId: "1:1006438253592:web:cfd8411bd6007779966f6d",
-});
-const fdb = getFirestore(firebaseApp);
+// ---- Firestore REST (no firebase npm package needed on Railway) ----
+const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY || "AIzaSyCsGDgxVWwZMg15Nmc__lCDj2DcfTH1MyM";
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "bahr-educational";
+const FIRESTORE_BASE_URL = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents`;
 
 const logger = pino({ level: "warn" });
 const app = express();
@@ -54,24 +44,144 @@ function phoneFromJid(jid) {
   return String(jid || "").replace(/@.*$/, "").replace(/[^\d]/g, "");
 }
 
+function unwrapMessage(message) {
+  let current = message;
+  for (let i = 0; i < 8; i += 1) {
+    const next =
+      current?.ephemeralMessage?.message ||
+      current?.viewOnceMessage?.message ||
+      current?.viewOnceMessageV2?.message ||
+      current?.viewOnceMessageV2Extension?.message ||
+      current?.documentWithCaptionMessage?.message;
+    if (!next) break;
+    current = next;
+  }
+  return current || message || {};
+}
+
+function parseNativeFlowText(message) {
+  const paramsJson = message?.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson;
+  if (!paramsJson) return "";
+  try {
+    const params = JSON.parse(paramsJson);
+    return params?.display_text || params?.title || params?.id || params?.name || "";
+  } catch {
+    return "";
+  }
+}
+
+function extractMessageText(message) {
+  const m = unwrapMessage(message);
+  return String(
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.buttonsResponseMessage?.selectedDisplayText ||
+    m.buttonsResponseMessage?.selectedButtonId ||
+    m.templateButtonReplyMessage?.selectedDisplayText ||
+    m.templateButtonReplyMessage?.selectedId ||
+    m.listResponseMessage?.title ||
+    m.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    m.interactiveResponseMessage?.body?.text ||
+    parseNativeFlowText(m) ||
+    ""
+  ).trim();
+}
+
+function isActivationYes(text) {
+  const normalized = String(text || "")
+    .normalize("NFKD")
+    .replace(/[\u064B-\u065F\u0670\u200C\u200D]/g, "")
+    .replace(/[إأآ]/g, "ا")
+    .replace(/\s+/g, " ")
+    .trim();
+  return /(^|[\s,.!?؟،؛:*_\-])نعم([\s,.!?؟،؛:*_\-]|$)/u.test(normalized) || /^yes$/i.test(normalized) || normalized === "ACTIVATE_YES";
+}
+
+function firestoreValue(value) {
+  if (value === "SERVER_TIMESTAMP") return { timestampValue: new Date().toISOString() };
+  if (typeof value === "number") return Number.isInteger(value) ? { integerValue: value } : { doubleValue: value };
+  if (typeof value === "boolean") return { booleanValue: value };
+  return { stringValue: String(value ?? "") };
+}
+
+function firestoreDocument(fields) {
+  return {
+    fields: Object.fromEntries(
+      Object.entries(fields).filter(([, value]) => value !== undefined).map(([key, value]) => [key, firestoreValue(value)])
+    ),
+  };
+}
+
+async function firestoreRequest(path, { method = "PATCH", body } = {}) {
+  const url = `${FIRESTORE_BASE_URL}/${path}?key=${encodeURIComponent(FIREBASE_API_KEY)}`;
+  const response = await fetch(url, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!response.ok) throw new Error(`Firestore ${response.status}: ${await response.text()}`);
+  return response.json();
+}
+
+async function mergeFirestoreDoc(path, fields) {
+  const keys = Object.keys(fields).filter((key) => fields[key] !== undefined);
+  const query = keys.map((key) => `updateMask.fieldPaths=${encodeURIComponent(key)}`).join("&");
+  const url = `${FIRESTORE_BASE_URL}/${path}?key=${encodeURIComponent(FIREBASE_API_KEY)}${query ? `&${query}` : ""}`;
+  const response = await fetch(url, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(firestoreDocument(fields)),
+  });
+  if (!response.ok) throw new Error(`Firestore ${response.status}: ${await response.text()}`);
+  return response.json();
+}
+
+async function incrementFirestoreField(path, fieldPath, amount = 1) {
+  const url = `${FIRESTORE_BASE_URL}:commit?key=${encodeURIComponent(FIREBASE_API_KEY)}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      writes: [{
+        transform: {
+          document: `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/${path}`,
+          fieldTransforms: [{ fieldPath, increment: { integerValue: amount } }],
+        },
+      }],
+    }),
+  });
+  if (!response.ok) throw new Error(`Firestore ${response.status}: ${await response.text()}`);
+  return response.json();
+}
+
+function safeDocId(value) {
+  return encodeURIComponent(String(value)).replaceAll("%", "_");
+}
+
 // ---- Firestore helpers ----
 async function logMessage({ phone, direction, text, parentName }) {
   if (!phone) return;
   try {
-    await addDoc(collection(fdb, "conversations", phone, "messages"), {
+    await firestoreRequest(`conversations/${safeDocId(phone)}/messages`, {
+      method: "POST",
+      body: firestoreDocument({
       direction,                 // "in" | "out"
       text: String(text || ""),
-      createdAt: serverTimestamp(),
+      createdAt: "SERVER_TIMESTAMP",
+      }),
     });
     const patch = {
       phone,
       lastMessage: String(text || ""),
       lastDirection: direction,
-      lastMessageAt: serverTimestamp(),
+      lastMessageAt: "SERVER_TIMESTAMP",
     };
     if (parentName) patch.parentName = parentName;
-    if (direction === "in") patch.unread = increment(1);
-    await setDoc(doc(fdb, "conversations", phone), patch, { merge: true });
+    const conversationPath = `conversations/${safeDocId(phone)}`;
+    await mergeFirestoreDoc(conversationPath, patch);
+    if (direction === "in") await incrementFirestoreField(conversationPath, "unread", 1);
   } catch (e) {
     console.error("logMessage failed", e?.message || e);
   }
@@ -85,8 +195,8 @@ async function setParentActivation({ phone, parentName, activated }) {
       activated: !!activated,
     };
     if (parentName) patch.parentName = parentName;
-    if (activated) patch.activatedAt = serverTimestamp();
-    await setDoc(doc(fdb, "parents", phone), patch, { merge: true });
+    if (activated) patch.activatedAt = "SERVER_TIMESTAMP";
+    await mergeFirestoreDoc(`parents/${safeDocId(phone)}`, patch);
   } catch (e) {
     console.error("setParentActivation failed", e?.message || e);
   }
@@ -135,16 +245,7 @@ async function start() {
           const jid = msg.key.remoteJid;
           if (!jid || !jid.endsWith("@s.whatsapp.net")) continue;
 
-          const text =
-            msg.message.conversation ||
-            msg.message.extendedTextMessage?.text ||
-            msg.message.buttonsResponseMessage?.selectedDisplayText ||
-            msg.message.buttonsResponseMessage?.selectedButtonId ||
-            msg.message.templateButtonReplyMessage?.selectedDisplayText ||
-            msg.message.templateButtonReplyMessage?.selectedId ||
-            msg.message.listResponseMessage?.title ||
-            "";
-          const trimmed = String(text).trim();
+          const trimmed = extractMessageText(msg.message);
           if (!trimmed) continue;
 
           const phone = phoneFromJid(jid);
@@ -154,11 +255,7 @@ async function start() {
           // Log inbound message
           await logMessage({ phone, direction: "in", text: trimmed, parentName });
 
-          const looksLikeYes =
-            /نعم/.test(trimmed) ||
-            /^أريد/.test(trimmed) ||
-            trimmed === "ACTIVATE_YES" ||
-            /^yes$/i.test(trimmed);
+          const looksLikeYes = isActivationYes(trimmed);
 
           if (looksLikeYes && !activationConfirmed.has(jid)) {
             activationConfirmed.add(jid);
@@ -243,10 +340,7 @@ app.post("/send-activation", auth, async (req, res) => {
     activationConfirmed.delete(jid);
     await setParentActivation({ phone, parentName: name, activated: false });
 
-    const fullText =
-      bodyText +
-      "\n\n👈 للتفعيل، يكفي الرد على هذه الرسالة بكلمة:\n\n*نعم*\n\n" +
-      "وسيتم تفعيل اشتراككم تلقائيًا خلال ثوانٍ.";
+    const fullText = bodyText + "\n\n👈 للتفعيل، يكفي الرد على هذه الرسالة بكلمة:\n\n*نعم*\n\nوسيتم تفعيل اشتراككم تلقائيًا خلال ثوانٍ.";
 
     const r = await sock.sendMessage(jid, { text: fullText });
     await logMessage({ phone, direction: "out", text: fullText, parentName: name });
