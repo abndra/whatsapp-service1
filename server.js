@@ -14,53 +14,30 @@ const AUTH_DIR = process.env.AUTH_DIR || "/data/auth";
 
 const logger = pino({ level: "warn" });
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
 let sock = null;
 let latestQR = null;
-let connState = "disconnected";
+let connState = "disconnected"; // disconnected | connecting | open
 let starting = false;
 let lastError = null;
 let lastUpdateAt = null;
 
-// Activation tracking: phone (digits only) -> { confirmed: bool, ts }
-const activations = new Map();
+// Tracks parent JIDs that received an activation message and are pending a reply.
+// Map<jid, { sentAt: number, parentName: string }>
+const activationPending = new Map();
+// Set of jids that have already auto-confirmed (idempotency).
+const activationConfirmed = new Set();
 
 function touch(error = null) {
   lastUpdateAt = new Date().toISOString();
   if (error) lastError = String(error?.message || error);
 }
 
-function jidToPhone(jid) {
-  return String(jid || "").split("@")[0].replace(/[^\d]/g, "");
+function jidFor(to) {
+  const phone = String(to).replace(/[^\d]/g, "");
+  return phone.includes("@") ? phone : `${phone}@s.whatsapp.net`;
 }
-
-function extractText(msg) {
-  if (!msg) return "";
-  if (msg.conversation) return msg.conversation;
-  if (msg.extendedTextMessage?.text) return msg.extendedTextMessage.text;
-  if (msg.buttonsResponseMessage?.selectedDisplayText)
-    return msg.buttonsResponseMessage.selectedDisplayText;
-  if (msg.templateButtonReplyMessage?.selectedDisplayText)
-    return msg.templateButtonReplyMessage.selectedDisplayText;
-  if (msg.interactiveResponseMessage?.body?.text)
-    return msg.interactiveResponseMessage.body.text;
-  if (msg.listResponseMessage?.title) return msg.listResponseMessage.title;
-  return "";
-}
-
-function extractButtonId(msg) {
-  if (!msg) return "";
-  return (
-    msg.buttonsResponseMessage?.selectedButtonId ||
-    msg.templateButtonReplyMessage?.selectedId ||
-    msg.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson ||
-    ""
-  );
-}
-
-const ACTIVATION_REPLY_TEXT =
-  "✅ تم تفعيل نظام \"غيابي\" بنجاح.\n\nسيصلكم إشعار فوري عند تسجيل غياب ابنكم/ابنتكم. شكرًا لتعاونكم 🌟";
 
 async function start() {
   if (starting) return;
@@ -110,35 +87,55 @@ async function start() {
       }
     });
 
-    // Listen for incoming messages → auto-reply on activation button click
-    sock.ev.on("messages.upsert", async (ev) => {
+    // ---- Auto-reply listener for the activation flow ----
+    // When a parent that received an activation message sends back any message
+    // (typically by tapping the green "نعم أريد" quick-reply button),
+    // we send an automatic confirmation reply back to them.
+    sock.ev.on("messages.upsert", async (m) => {
       try {
-        if (ev.type !== "notify") return;
-        for (const m of ev.messages || []) {
-          if (!m.message || m.key.fromMe) continue;
-          const jid = m.key.remoteJid;
-          if (!jid || jid.endsWith("@g.us")) continue;
-          const text = extractText(m.message).trim();
-          const btnId = extractButtonId(m.message);
-          const phone = jidToPhone(jid);
+        if (m.type !== "notify") return;
+        for (const msg of m.messages || []) {
+          if (!msg.message || msg.key.fromMe) continue;
+          const jid = msg.key.remoteJid;
+          if (!jid || !jid.endsWith("@s.whatsapp.net")) continue;
 
-          const isActivation =
-            btnId === "activate_yes" ||
-            /^نعم[،,]?\s*أريد/i.test(text) ||
-            /^نعم\s*أريد\s*التفعيل/i.test(text) ||
-            text === "نعم أريد";
+          // Extract text from any of the possible message shapes
+          const text =
+            msg.message.conversation ||
+            msg.message.extendedTextMessage?.text ||
+            msg.message.buttonsResponseMessage?.selectedDisplayText ||
+            msg.message.buttonsResponseMessage?.selectedButtonId ||
+            msg.message.templateButtonReplyMessage?.selectedDisplayText ||
+            msg.message.templateButtonReplyMessage?.selectedId ||
+            msg.message.listResponseMessage?.title ||
+            "";
 
-          if (isActivation) {
-            activations.set(phone, { confirmed: true, ts: Date.now() });
+          const trimmed = String(text).trim();
+          if (!trimmed) continue;
+
+          const isPending = activationPending.has(jid);
+          const looksLikeYes =
+            /نعم/.test(trimmed) ||
+            /^أريد/.test(trimmed) ||
+            trimmed === "ACTIVATE_YES" ||
+            /yes/i.test(trimmed);
+
+          if (isPending && looksLikeYes && !activationConfirmed.has(jid)) {
+            activationConfirmed.add(jid);
+            const reply =
+              "✅ تم تفعيل اشتراككم في نظام \"غيابي\" بنجاح.\n\n" +
+              "بإذن الله ستصلكم إشعارات حضور وغياب أبنائكم بشكل مباشر.\n" +
+              "شكرًا لتعاونكم معنا.";
             try {
-              await sock.sendMessage(jid, { text: ACTIVATION_REPLY_TEXT });
+              await sock.sendMessage(jid, { text: reply });
             } catch (e) {
-              console.error("auto-reply failed", e?.message);
+              console.error("auto-reply send failed", e?.message || e);
             }
+            // keep in pending in case admin re-activates later; but mark confirmed
           }
         }
       } catch (e) {
-        console.error("messages.upsert error", e?.message);
+        console.error("messages.upsert handler error", e?.message || e);
       }
     });
   } catch (e) {
@@ -195,77 +192,63 @@ app.post("/send", auth, async (req, res) => {
     const { to, message } = req.body || {};
     if (!to || !message) return res.status(400).json({ error: "missing_to_or_message" });
     if (connState !== "open") return res.status(503).json({ error: "not_connected", state: connState });
-    const phone = String(to).replace(/[^\d]/g, "");
-    const jid = phone.includes("@") ? phone : `${phone}@s.whatsapp.net`;
-    const r = await sock.sendMessage(jid, { text: String(message) });
+    const r = await sock.sendMessage(jidFor(to), { text: String(message) });
     res.json({ ok: true, id: r?.key?.id });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || "send_failed" });
   }
 });
 
-// Send activation message with an interactive "نعم أريد" button.
-// Falls back to plain text if buttons fail on the device.
+// ---- Activation message ----
+// Body: { to: string, parentName: string }
+// Sends a styled message with a green quick-reply button "نعم أريد".
+// Falls back to plain text if the device renders buttons unreliably.
 app.post("/send-activation", auth, async (req, res) => {
   try {
     const { to, parentName } = req.body || {};
     if (!to) return res.status(400).json({ error: "missing_to" });
     if (connState !== "open") return res.status(503).json({ error: "not_connected", state: connState });
 
-    const phone = String(to).replace(/[^\d]/g, "");
-    const jid = phone.includes("@") ? phone : `${phone}@s.whatsapp.net`;
-    const name = (parentName && String(parentName).trim()) || "ولي الأمر الفاضل";
+    const name = (parentName && String(parentName).trim()) || "ولي الأمر";
+    const jid = jidFor(to);
 
-    const body =
-      `السلام عليكم ورحمة الله وبركاته،\n` +
+    const bodyText =
+      "السلام عليكم ورحمة الله وبركاته،\n\n" +
       `إلى الفاضل: ${name}\n\n` +
-      `نود إعلامكم بأنه تم إرسال هذه الرسالة لتأكيد تفعيل نظام "غيابي"، ` +
-      `والذي يتيح لكم استقبال إشعارات غياب أبنائكم ومتابعة حضورهم بشكل مستمر؛ ` +
-      `حرصًا على تعزيز التواصل بين المدرسة وأولياء الأمور.\n\n` +
-      `هل تودون تفعيل نظام "غيابي" لتصلكم إشعارات الحضور والغياب بشكل مباشر ومستمر؟`;
+      "نود إعلامكم بأنه تم إرسال هذه الرسالة لتأكيد تفعيل نظام \"غيابي\"، " +
+      "والذي يتيح لكم استقبال إشعارات غياب أبنائكم ومتابعة حضورهم بشكل مستمر؛ " +
+      "حرصًا على تعزيز التواصل بين المدرسة وأولياء الأمور.\n\n" +
+      "هل تودون تفعيل نظام \"غيابي\" لتصلكم إشعارات الحضور والغياب بشكل مباشر ومستمر؟";
 
-    let sent = null;
-    let mode = "buttons";
+    activationPending.set(jid, { sentAt: Date.now(), parentName: name });
+    activationConfirmed.delete(jid);
+
+    let id;
     try {
-      // Try interactive buttons (newer Baileys)
-      sent = await sock.sendMessage(jid, {
-        text: body,
-        footer: "منصة غيابي · للتفعيل اضغط الزر بالأسفل",
+      // Quick-reply buttons (the closest to a green tap-to-reply CTA on Baileys).
+      const buttonsMsg = {
+        text: bodyText,
+        footer: "منصة غيابي · للتواصل مع المدرسة",
         buttons: [
-          { buttonId: "activate_yes", buttonText: { displayText: "✅ نعم، أريد التفعيل" }, type: 1 },
+          { buttonId: "ACTIVATE_YES", buttonText: { displayText: "✅ نعم أريد" }, type: 1 },
         ],
         headerType: 1,
-      });
-    } catch (e1) {
-      console.warn("buttons failed, trying templateMessage:", e1?.message);
-      try {
-        sent = await sock.sendMessage(jid, {
-          text: body,
-          footer: "منصة غيابي",
-          templateButtons: [
-            { index: 1, quickReplyButton: { displayText: "✅ نعم، أريد التفعيل", id: "activate_yes" } },
-          ],
-        });
-        mode = "template";
-      } catch (e2) {
-        console.warn("template failed, falling back to text:", e2?.message);
-        sent = await sock.sendMessage(jid, {
-          text: body + `\n\nللرد بالموافقة، أرسل: نعم أريد`,
-        });
-        mode = "text";
-      }
+      };
+      const r = await sock.sendMessage(jid, buttonsMsg);
+      id = r?.key?.id;
+    } catch (e) {
+      console.warn("buttons send failed, falling back to text:", e?.message || e);
+      const fallback =
+        bodyText +
+        "\n\nللتفعيل، يرجى الرد بكلمة: *نعم أريد*";
+      const r = await sock.sendMessage(jid, { text: fallback });
+      id = r?.key?.id;
     }
-    res.json({ ok: true, id: sent?.key?.id, mode });
+
+    res.json({ ok: true, id });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || "send_failed" });
   }
-});
-
-// Read activation status (which parents have confirmed)
-app.get("/activations", auth, (_req, res) => {
-  const out = {};
-  for (const [k, v] of activations.entries()) out[k] = v;
-  res.json({ activations: out });
 });
 
 app.listen(PORT, () => console.log(`WhatsApp service on :${PORT}`));
