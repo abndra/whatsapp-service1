@@ -19,40 +19,85 @@ app.use(express.json());
 let sock = null;
 let latestQR = null;
 let connState = "disconnected"; // disconnected | connecting | open
+let starting = false;
+let lastError = null;
+let lastUpdateAt = null;
+
+function touch(error = null) {
+  lastUpdateAt = new Date().toISOString();
+  if (error) lastError = String(error?.message || error);
+}
 
 async function start() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+  if (starting) return;
+  starting = true;
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    const { version } = await fetchLatestBaileysVersion();
 
-  sock = makeWASocket({
-    version,
-    auth: state,
-    logger,
-    printQRInTerminal: false,
-    browser: ["Ghiyabi", "Chrome", "1.0"],
-  });
+    sock = makeWASocket({
+      version,
+      auth: state,
+      logger,
+      printQRInTerminal: false,
+      browser: ["Ghiyabi", "Chrome", "1.0"],
+    });
 
-  sock.ev.on("creds.update", saveCreds);
+    sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", async (u) => {
-    const { connection, lastDisconnect, qr } = u;
-    if (qr) {
-      latestQR = await QRCode.toDataURL(qr);
-      connState = "connecting";
-    }
-    if (connection === "open") {
-      latestQR = null;
-      connState = "open";
-      console.log("WhatsApp connected");
-    }
-    if (connection === "close") {
-      connState = "disconnected";
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
-      console.log("Connection closed.", code, "reconnect:", shouldReconnect);
-      if (shouldReconnect) setTimeout(start, 2000);
-    }
-  });
+    sock.ev.on("connection.update", async (u) => {
+      const { connection, lastDisconnect, qr } = u;
+      touch(lastDisconnect?.error || null);
+      if (qr) {
+        latestQR = await QRCode.toDataURL(qr);
+        connState = "connecting";
+        lastError = null;
+        console.log("New QR generated");
+      }
+      if (connection === "open") {
+        latestQR = null;
+        connState = "open";
+        console.log("WhatsApp connected");
+      }
+      if (connection === "close") {
+        connState = "disconnected";
+        latestQR = null;
+        const code = lastDisconnect?.error?.output?.statusCode;
+        const loggedOut = code === DisconnectReason.loggedOut;
+        console.log("Connection closed.", code, "loggedOut:", loggedOut);
+        if (loggedOut) {
+          // Wipe creds so a fresh QR is generated on next start
+          try {
+            const fs = await import("fs/promises");
+            await fs.rm(AUTH_DIR, { recursive: true, force: true });
+          } catch {}
+        }
+        setTimeout(() => { starting = false; start(); }, 2000);
+        return;
+      }
+    });
+  } catch (e) {
+    touch(e);
+    console.error("start error", e);
+    setTimeout(() => { starting = false; start(); }, 3000);
+    return;
+  } finally {
+    // allow re-entry only via reconnect path above
+  }
+}
+
+async function restart() {
+  try { await sock?.logout(); } catch {}
+  try { sock?.end?.(undefined); } catch {}
+  try {
+    const fs = await import("fs/promises");
+    await fs.rm(AUTH_DIR, { recursive: true, force: true });
+  } catch {}
+  sock = null;
+  latestQR = null;
+  connState = "disconnected";
+  starting = false;
+  start();
 }
 
 function auth(req, res, next) {
@@ -64,7 +109,7 @@ function auth(req, res, next) {
 app.get("/", (_req, res) => res.json({ ok: true, state: connState }));
 
 app.get("/status", auth, (_req, res) => {
-  res.json({ state: connState, hasQR: !!latestQR });
+  res.json({ state: connState, hasQR: !!latestQR, lastError, lastUpdateAt });
 });
 
 app.get("/qr", auth, (_req, res) => {
@@ -73,7 +118,12 @@ app.get("/qr", auth, (_req, res) => {
 });
 
 app.post("/logout", auth, async (_req, res) => {
-  try { await sock?.logout(); } catch {}
+  await restart();
+  res.json({ ok: true, restarted: true });
+});
+
+app.post("/restart", auth, async (_req, res) => {
+  await restart();
   res.json({ ok: true });
 });
 
