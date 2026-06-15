@@ -29,6 +29,7 @@ let lastError = null;
 let lastUpdateAt = null;
 let lastInbound = null;
 let lastActivation = null;
+let activationSyncTimer = null;
 const serviceStartedAt = Date.now();
 
 const activationPending = new Map();
@@ -246,6 +247,70 @@ async function getParentDoc(phone) {
   }
 }
 
+function firestoreString(fields, key) {
+  const value = fields?.[key];
+  return String(value?.stringValue || value?.integerValue || value?.doubleValue || "");
+}
+
+function docIdFromName(name) {
+  return String(name || "").split("/").pop() || "";
+}
+
+async function listConversations() {
+  try {
+    const url = `${FIRESTORE_BASE_URL}/conversations?key=${encodeURIComponent(FIREBASE_API_KEY)}`;
+    const r = await fetch(url);
+    if (!r.ok) return [];
+    const json = await r.json();
+    return (json?.documents || []).map((document) => {
+      const fields = document?.fields || {};
+      return {
+        phone: normalizePhone(firestoreString(fields, "phone") || docIdFromName(document?.name)),
+        parentName: firestoreString(fields, "parentName") || null,
+        lastDirection: firestoreString(fields, "lastDirection"),
+        lastMessage: firestoreString(fields, "lastMessage"),
+      };
+    });
+  } catch (e) {
+    console.error("listConversations failed", e?.message || e);
+    return [];
+  }
+}
+
+async function confirmActivation({ phone, jid, parentName }) {
+  const normalizedPhone = normalizePhone(phone);
+  if (!normalizedPhone) return;
+  const existing = await getParentDoc(normalizedPhone);
+  const alreadyActivated = !!existing?.activated;
+  const name = parentName || existing?.parentName || null;
+
+  activationConfirmed.add(normalizedPhone);
+  if (jid) activationConfirmed.add(jid);
+  await setParentActivation({ phone: normalizedPhone, parentName: name, activated: true });
+
+  const reply = alreadyActivated
+    ? "✅ اشتراككم في نظام «غيابي» مفعّل بالفعل.\nستصلكم إشعارات حضور وغياب أبنائكم بإذن الله."
+    : "✅ تم تفعيل اشتراككم في نظام «غيابي» بنجاح.\nستصلكم إشعارات حضور وغياب أبنائكم بإذن الله.";
+
+  try {
+    await sock.sendMessage(jid || jidFor(normalizedPhone), { text: reply });
+    await logMessage({ phone: normalizedPhone, direction: "out", text: reply, parentName: name });
+    lastActivation = { phone: normalizedPhone, jid: jid || jidFor(normalizedPhone), at: new Date().toISOString(), replied: true, alreadyActivated };
+  } catch (e) {
+    console.error("auto-reply send failed", e?.message || e);
+    lastActivation = { phone: normalizedPhone, jid: jid || jidFor(normalizedPhone), at: new Date().toISOString(), replied: false, error: String(e?.message || e) };
+  }
+}
+
+async function syncActivationRepliesFromConversations() {
+  if (connState !== "open" || !sock) return;
+  const rows = await listConversations();
+  for (const row of rows) {
+    if (!row.phone || row.lastDirection !== "in" || !isActivationYes(row.lastMessage)) continue;
+    await confirmActivation({ phone: row.phone, jid: jidFor(row.phone), parentName: row.parentName });
+  }
+}
+
 async function start() {
   if (starting) return;
   starting = true;
@@ -269,9 +334,17 @@ async function start() {
         connState = "connecting";
         lastError = null;
       }
-      if (connection === "open") { latestQR = null; connState = "open"; }
+      if (connection === "open") {
+        latestQR = null;
+        connState = "open";
+        if (!activationSyncTimer) {
+          activationSyncTimer = setInterval(() => syncActivationRepliesFromConversations().catch((e) => console.error("activation sync failed", e?.message || e)), 15_000);
+        }
+        syncActivationRepliesFromConversations().catch((e) => console.error("activation sync failed", e?.message || e));
+      }
       if (connection === "close") {
         connState = "disconnected"; latestQR = null;
+        if (activationSyncTimer) { clearInterval(activationSyncTimer); activationSyncTimer = null; }
         const code = lastDisconnect?.error?.output?.statusCode;
         const loggedOut = code === DisconnectReason.loggedOut;
         if (loggedOut) {
@@ -313,21 +386,9 @@ async function start() {
           await logMessage({ phone, direction: "in", text: trimmed, parentName });
 
           const looksLikeYes = isActivationYes(trimmed);
-          const alreadyConfirmed = activationConfirmed.has(phone) || activationConfirmed.has(jid);
 
-          if (looksLikeYes && !alreadyConfirmed) {
-            activationConfirmed.add(phone);
-            activationConfirmed.add(jid);
-            await setParentActivation({ phone, parentName, activated: true });
-            const reply = "✅ تم تفعيل اشتراككم في نظام «غيابي» بنجاح.\nستصلكم إشعارات حضور وغياب أبنائكم بإذن الله.";
-            try {
-              await sock.sendMessage(jid, { text: reply });
-              await logMessage({ phone, direction: "out", text: reply, parentName });
-              lastActivation = { phone, jid, at: new Date().toISOString(), replied: true };
-            } catch (e) {
-              console.error("auto-reply send failed", e?.message || e);
-              lastActivation = { phone, jid, at: new Date().toISOString(), replied: false, error: String(e?.message || e) };
-            }
+          if (looksLikeYes) {
+            await confirmActivation({ phone, jid, parentName });
           }
         }
       } catch (e) {
@@ -366,13 +427,19 @@ app.post("/restart", auth, async (_req, res) => { await restart(); res.json({ ok
 
 app.post("/send", auth, async (req, res) => {
   try {
-    const { to, message, parentName, logConversation } = req.body || {};
-    if (!to || !message) return res.status(400).json({ error: "missing_to_or_message" });
+    const { to, message, parentName, logConversation, imageUrl } = req.body || {};
+    if (!to || (!message && !imageUrl)) return res.status(400).json({ error: "missing_to_or_message" });
     if (connState !== "open") return res.status(503).json({ error: "not_connected", state: connState });
     const jid = jidFor(to);
-    const r = await sock.sendMessage(jid, { text: String(message) });
+    let r;
+    if (imageUrl) {
+      r = await sock.sendMessage(jid, { image: { url: String(imageUrl) }, caption: message ? String(message) : undefined });
+    } else {
+      r = await sock.sendMessage(jid, { text: String(message) });
+    }
     if (logConversation !== false) {
-      await logMessage({ phone: phoneFromJid(jid), direction: "out", text: message, parentName });
+      const logText = imageUrl ? `[صورة] ${message || ""}`.trim() : String(message || "");
+      await logMessage({ phone: phoneFromJid(jid), direction: "out", text: logText, parentName });
     }
     res.json({ ok: true, id: r?.key?.id });
   } catch (e) {
@@ -411,6 +478,16 @@ app.post("/send-activation", auth, async (req, res) => {
     res.json({ ok: true, id: r?.key?.id });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || "send_failed" });
+  }
+});
+
+app.post("/sync-activation-replies", auth, async (_req, res) => {
+  try {
+    if (connState !== "open") return res.status(503).json({ ok: false, error: "not_connected", state: connState });
+    await syncActivationRepliesFromConversations();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || "sync_failed" });
   }
 });
 
